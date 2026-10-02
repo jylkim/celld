@@ -394,20 +394,16 @@ Repeat `-c`/`--config` to run several Workers in one session:
 celld dev -c producer/wrangler.jsonc -c consumer/wrangler.jsonc
 ```
 
-The first config owns the primary HTTP entry and the local `.celld/dev`
-state directory; the remaining configs are dependencies reached through the
-existing binding graph (service bindings or Queues). Pass either one positional `PROJECT` or repeated `-c`/`--config`,
-not both. Config paths resolve like `PROJECT` (a directory or a file), are
-canonicalized, and duplicate paths or duplicate Worker `name` values are refused
-before any state is touched.
+The first config provides the HTTP entry point and the base directory for
+shared `.celld/dev` state; the other Workers are reached through bindings.
 
-The command reads a `.dev.vars` file beside every Wrangler configuration, as
+The command reads a `.dev.vars` file beside each Wrangler configuration, as
 `wrangler dev` does. Each line of the file has the form `NAME=value`. A
 value can be wrapped in double or single quotes, and the command removes
 the quotes. The command does not read the other dotenv features, such as a
 comment after a value or a value on more than one line. An entry becomes a
-Worker variable for that config only, and it overrides an entry of the same name in the `vars`
-of that configuration. Only `celld dev` reads the file, so a local
+Worker variable for that Worker, and it overrides an entry of the same name
+in the `vars` of that configuration. Only `celld dev` reads the file, so a local
 credential does not reach a fleet through `celld deploy`. Add `.dev.vars`
 to the application's `.gitignore` file. A change to the file rebuilds the
 application, so a new value takes effect without a restart. The command
@@ -415,11 +411,9 @@ writes each value into the local deployment record under `.celld/dev`, and
 `--clean` deletes that record.
 
 The command stores the local objects and the celld work files in `.celld/dev`
-below the first (primary) project directory. Add `.celld/` to the application's `.gitignore`
-file. A normal shutdown keeps this directory, so the next invocation uses the
-same durable application state. With repeated `-c`/`--config`, only the primary
-owns state; `--clean` deletes only the primary `.celld/dev` and is validated
-together with duplicate paths/names before anything is deleted.
+below the first project directory. Add `.celld/` to the application's
+`.gitignore` file. A normal shutdown keeps this directory, so the next
+invocation uses the same durable application state.
 
 This persistence holds across a configuration change, and celld does not
 migrate the stored state to match the new configuration. An object therefore
@@ -440,26 +434,21 @@ that never ran `celld dev`.
 The command does not expose the local object store through a fleet flag. A
 regular node or an operator subcommand must use a supported cloud bucket.
 
-The command watches every config root. A source or configuration
-change in any root builds every Worker before writing any deployment and restarts the local node. The current
+The command watches each project directory. A source or configuration
+change builds a new deployment and restarts the local node. The current
 application continues to run during the build, and a failed build does
-not replace it and performs no deployment writes; a repair rebuilds and restarts.
-Publication is sequential and non-transactional.
-The restart retains the durable application state.
+not replace it. The restart retains the durable application state.
 
 A read of a project file is not a change, so a tool that only reads the project
 does not start a build.
 
 The watcher ignores `.celld`, `.git`, `.wrangler`, `node_modules`, and `target`
-directories at each depth, relative to each watched root. A path under a `.celld`
-ancestor outside its root is still watched; only the root-relative `.celld` entries
-are ignored. With nested roots, the most-specific containing root decides
-root-relative `--watch-ignore` matches. Use `--watch-ignore PATTERN` to ignore an additional
+directories at each depth. Use `--watch-ignore PATTERN` to ignore an additional
 project-relative glob, and repeat the option to add more globs. The
 `--watch-ignore` option cannot be used with `--no-watch`. Use `--no-watch` to
 disable all automatic builds and restarts.
 
-The watcher does not watch a source file outside the project directory. Worker
+The watcher does not watch a source file outside the project directories. Worker
 projects need `esbuild` on `PATH`, and asset-only projects do not need it.
 
 ## Operate D1, KV, and R2
