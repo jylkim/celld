@@ -864,16 +864,10 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     write_impl(bucket, built, true).await
 }
 
-/// Write a co-hosted dependency without moving the fleet-wide pointer.
-///
-/// `celld dev` builds every Worker before writing any deployment, then
-/// writes each dependency through here and the primary through [`write`]
-/// last. The named pointer still resolves service-binding targets and the
-/// queue attachments still resolve consumers; only `deploy/current.json`
-/// stays on the primary, which is the sole application selector the runtime
-/// generation traverses from.
-// The writes are sequential and make no atomicity promise.
-pub async fn write_without_current(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+/// Write a co-hosted dependency without changing `deploy/current.json`.
+/// Named pointers and queue attachments are still published so the primary
+/// can resolve the dependency through its bindings.
+pub(crate) async fn write_without_current(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
     write_impl(bucket, built, false).await
 }
 
@@ -1285,12 +1279,7 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-/// The Worker name a config declares, without bundling.
-///
-/// `celld dev` rejects duplicate names before `--clean` can discard state
-/// or the local store is opened. It reads the same `name` key `build`
-/// validates, with the same bound, so the early refusal agrees with the
-/// build without running esbuild twice.
+/// Read and validate a config's Worker name without bundling.
 pub(crate) fn config_script_name(path: &Path) -> anyhow::Result<String> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
@@ -3048,4 +3037,35 @@ fn strip_jsonc(source: &str) -> String {
 #[cfg(all(test, celld_internal_tests))]
 mod deploy_contract {
     include!(env!("CELLD_INTERNAL_DEPLOY_TESTS"));
+}
+
+#[cfg(test)]
+mod multi_worker_config_tests {
+    use super::*;
+
+    fn write_config(dir: &Path, contents: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("mkdir");
+        let path = dir.join("wrangler.jsonc");
+        std::fs::write(&path, contents).expect("write config");
+        path
+    }
+
+    #[test]
+    fn script_name_jsonc_and_invalid_cases() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let valid = write_config(
+            &temp.path().join("proj"),
+            "// comment\n{ \"name\": \"svc-ok\", \"main\": \"index.js\", }\n",
+        );
+        assert_eq!(config_script_name(&valid).expect("name"), "svc-ok");
+        let missing = write_config(&temp.path().join("missing"), "{ \"main\": \"index.js\" }");
+        assert!(config_script_name(&missing).is_err());
+        let invalid = write_config(
+            &temp.path().join("invalid"),
+            "{ \"name\": \"UPPER\", \"main\": \"x.js\" }",
+        );
+        assert!(config_script_name(&invalid).is_err());
+        let not_object = write_config(&temp.path().join("array"), "[]");
+        assert!(config_script_name(&not_object).is_err());
+    }
 }

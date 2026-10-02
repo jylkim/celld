@@ -248,14 +248,9 @@ fn relevant_project_event(
         .any(|path| !ignored_multi_project_path(projects, path, ignored))
 }
 
-/// The ignore decision for one event path across every watched root.
-///
-/// Nested roots resolve to the most-specific project containing the path, so
-/// a root-relative `--watch-ignore` glob means what the nearest config means
-/// by it. A path under no watched root is not ignored: there is no relative
-/// form to judge it by, and the relative `.celld` exclusion below must never
-/// ignore a whole project merely because an ancestor outside its root is
-/// named `.celld`.
+/// Apply ignores relative to the most-specific watched root.
+/// Paths outside every root remain relevant, and ancestors above the root
+/// (including `.celld`) must not cause the project itself to be ignored.
 fn ignored_multi_project_path(projects: &[PathBuf], path: &Path, ignored: &[Pattern]) -> bool {
     let Some(root) = projects
         .iter()
@@ -452,7 +447,6 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     };
     let raw_configs: Vec<PathBuf> = if !options.configs.is_empty() {
-        // Each flag value names a directory or a config, exactly like PROJECT.
         options
             .configs
             .into_iter()
@@ -476,9 +470,8 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
             }
         }
     }
-    // Reject duplicate Worker names before `--clean` can discard state or
-    // the store is opened. The rebuild path rechecks the built names before
-    // any write, so a config edit that renames a Worker is still refused.
+    // Reject duplicate names before `--clean` can discard state.
+    // `deploy_session` rechecks names on rebuild before writing.
     {
         let mut seen = BTreeSet::new();
         for config in &configs {
@@ -589,13 +582,9 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         .collect())
 }
 
-/// Build every config before writing any deployment, then write each
-/// dependency without moving the fleet pointer and publish the primary last.
-///
-/// The existing runtime generation traverses the service and Queue
-/// relationships from that fleet pointer, so no second runtime is built here.
-/// A failed build returns before any write, leaving the running app
-/// unchanged. The sequential writes make no atomicity promise.
+/// Build all Workers before writing so a failed build leaves the running app
+/// unchanged. Publish dependencies first, then the primary fleet pointer that
+/// the runtime traverses from. Writes are sequential, not atomic.
 async fn deploy_session(configs: &[PathBuf], store: &Store, logs: bool) -> anyhow::Result<()> {
     let mut built = Vec::with_capacity(configs.len());
     for config in configs {
@@ -953,5 +942,236 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
     if waited.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod multi_worker_tests {
+    use super::*;
+    use glob::Pattern;
+    use notify::event::ModifyKind;
+    use std::fs;
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn parsed(parts: &[&str]) -> Options {
+        options_from_arguments(args(parts))
+            .expect("parse")
+            .expect("not help")
+    }
+
+    #[test]
+    fn repeated_c_flags_preserve_order_first_is_primary() {
+        let options = parsed(&["-c", "a", "--config", "b", "-c", "c"]);
+        assert_eq!(
+            options.configs,
+            vec![PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
+        assert!(options.project.is_none());
+        assert_eq!(options.configs[0], PathBuf::from("a"));
+    }
+
+    #[test]
+    fn positional_and_default_compatibility() {
+        let positional = parsed(&["mydir"]);
+        assert_eq!(positional.project, Some(PathBuf::from("mydir")));
+        assert!(positional.configs.is_empty());
+        let def = parsed(&[]);
+        assert!(def.project.is_none());
+        assert!(def.configs.is_empty());
+    }
+
+    #[test]
+    fn flag_negatives_rejected() {
+        for (argv, expected) in [
+            (vec!["mydir", "-c", "a"], "either PROJECT or repeated"),
+            (vec!["-c"], "-c/--config requires a value"),
+        ] {
+            let error = options_from_arguments(args(&argv)).expect_err("must fail");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "argv {argv:?}: unexpected error: {error:#}"
+            );
+        }
+    }
+
+    fn write_minimal_config(dir: &Path, name: &str) -> PathBuf {
+        fs::create_dir_all(dir).expect("mkdir");
+        fs::write(
+            dir.join("index.js"),
+            "export default { fetch() { return new Response(\"ok\"); } };",
+        )
+        .expect("write index");
+        let config = dir.join("wrangler.jsonc");
+        fs::write(
+            &config,
+            format!(
+                "{{ \"name\": \"{name}\", \"main\": \"index.js\", \"compatibility_date\": \"2026-01-01\" }}"
+            ),
+        )
+        .expect("write config");
+        config
+    }
+
+    #[test]
+    fn dev_vars_are_per_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_dir = temp.path().join("one");
+        let second_dir = temp.path().join("two");
+        let first = write_minimal_config(&first_dir, "svc-one");
+        let second = write_minimal_config(&second_dir, "svc-two");
+        fs::write(
+            first_dir.join(".dev.vars"),
+            "WHO=one-dev\n# comment\nEMPTY=\n",
+        )
+        .expect("vars");
+        fs::write(second_dir.join(".dev.vars"), "WHO=\"two dev\"\n").expect("vars");
+        let first_vars = read_dev_vars(&first).expect("first vars");
+        let second_vars = read_dev_vars(&second).expect("second vars");
+        assert_eq!(first_vars.get("WHO").map(String::as_str), Some("one-dev"));
+        assert_eq!(second_vars.get("WHO").map(String::as_str), Some("two dev"));
+        assert_eq!(first_vars.get("EMPTY").map(String::as_str), Some(""));
+        assert!(!second_vars.contains_key("EMPTY"));
+    }
+
+    fn modify_event(paths: Vec<PathBuf>) -> notify::Event {
+        notify::Event {
+            kind: notify::EventKind::Modify(ModifyKind::Any),
+            paths,
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn ignored_rules_apply_on_every_root() {
+        let first = PathBuf::from("/first");
+        let second = PathBuf::from("/second");
+        let roots = vec![first.clone(), second.clone()];
+        let generated = Pattern::new("generated/**").expect("pattern");
+        let ignored = [generated];
+        for root in [&first, &second] {
+            assert!(ignored_multi_project_path(
+                &roots,
+                &root.join(".celld/dev/x"),
+                &[]
+            ));
+            assert!(ignored_multi_project_path(
+                &roots,
+                &root.join("node_modules/x.js"),
+                &[]
+            ));
+            assert!(ignored_multi_project_path(
+                &roots,
+                &root.join("target/x"),
+                &[]
+            ));
+            assert!(ignored_multi_project_path(
+                &roots,
+                &root.join("generated/a.js"),
+                &ignored
+            ));
+            assert!(!ignored_multi_project_path(
+                &roots,
+                &root.join("index.js"),
+                &ignored
+            ));
+        }
+        let dir_event = modify_event(vec![first.join("generated")]);
+        assert!(!relevant_project_event(&roots, &dir_event, &ignored));
+        let src_event = modify_event(vec![first.join("src/a.js")]);
+        assert!(relevant_project_event(&roots, &src_event, &ignored));
+    }
+
+    #[test]
+    fn nested_roots_use_most_specific_for_ignores() {
+        let outer = PathBuf::from("/outer");
+        let inner = outer.join("inner");
+        let roots = vec![outer.clone(), inner.clone()];
+        let pattern = Pattern::new("inner/file.js").expect("pattern");
+        let path = inner.join("file.js");
+        assert!(
+            !ignored_multi_project_path(&roots, &path, &[pattern]),
+            "most-specific root sees file.js, not inner/file.js"
+        );
+        let outer_only = vec![outer.clone()];
+        let pattern = Pattern::new("inner/file.js").expect("pattern");
+        assert!(ignored_multi_project_path(&outer_only, &path, &[pattern]));
+    }
+
+    #[test]
+    fn ancestor_named_celld_outside_root_does_not_ignore() {
+        let root = PathBuf::from("/tmp/.celld/outer/project");
+        let path = root.join("src/index.js");
+        assert!(!ignored_project_path(&root, &path, &[]));
+        assert!(!ignored_multi_project_path(
+            std::slice::from_ref(&root),
+            &path,
+            &[]
+        ));
+        let event = modify_event(vec![path]);
+        assert!(relevant_project_event(&[root], &event, &[]));
+    }
+
+    #[tokio::test]
+    async fn duplicate_names_fail_before_clean_deletes_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary_dir = temp.path().join("primary");
+        let secondary_dir = temp.path().join("secondary");
+        let primary = write_minimal_config(&primary_dir, "same-name");
+        let secondary = write_minimal_config(&secondary_dir, "same-name");
+        let state_dir = primary_dir.join(".celld/dev");
+        fs::create_dir_all(&state_dir).expect("mkdir state");
+        fs::write(state_dir.join("MARKER"), "preserve").expect("marker");
+        let result = run(args(&[
+            "-c",
+            primary.to_str().expect("utf8"),
+            "-c",
+            secondary.to_str().expect("utf8"),
+            "--clean",
+            "--no-watch",
+        ]))
+        .await;
+        let error = result.expect_err("duplicates must fail");
+        assert!(
+            format!("{error:#}").contains("duplicate Worker name"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            state_dir.join("MARKER").exists(),
+            "MARKER must survive failed validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_paths_fail_before_clean_deletes_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let primary_dir = temp.path().join("primary");
+        write_minimal_config(&primary_dir, "svc-a");
+        let state_dir = primary_dir.join(".celld/dev");
+        fs::create_dir_all(&state_dir).expect("mkdir state");
+        fs::write(state_dir.join("MARKER"), "preserve").expect("marker");
+        // Two spellings of the same file: the containing directory (resolved
+        // to its wrangler file) and the file with a lexical dot component.
+        let via_dir = primary_dir.to_str().expect("utf8").to_string();
+        let via_dot = format!("{}/./wrangler.jsonc", primary_dir.display());
+        assert_ne!(via_dir, via_dot);
+        let result = run(args(&[
+            "-c",
+            &via_dir,
+            "-c",
+            &via_dot,
+            "--clean",
+            "--no-watch",
+        ]))
+        .await;
+        let error = result.expect_err("duplicates must fail");
+        assert!(
+            format!("{error:#}").contains("duplicate Wrangler config"),
+            "unexpected error: {error:#}"
+        );
+        assert!(state_dir.join("MARKER").exists());
     }
 }
