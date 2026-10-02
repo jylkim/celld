@@ -861,6 +861,23 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    write_impl(bucket, built, true).await
+}
+
+/// Write a co-hosted dependency without moving the fleet-wide pointer.
+///
+/// `celld dev` builds every Worker before writing any deployment, then
+/// writes each dependency through here and the primary through [`write`]
+/// last. The named pointer still resolves service-binding targets and the
+/// queue attachments still resolve consumers; only `deploy/current.json`
+/// stays on the primary, which is the sole application selector the runtime
+/// generation traverses from.
+// The writes are sequential and make no atomicity promise.
+pub async fn write_without_current(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    write_impl(bucket, built, false).await
+}
+
+async fn write_impl(bucket: &Bucket, built: &Built, publish_current: bool) -> anyhow::Result<()> {
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -925,7 +942,9 @@ pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
         encoded.clone(),
     )
     .await?;
-    put_pointer(bucket, "deploy/current.json", encoded).await?;
+    if publish_current {
+        put_pointer(bucket, "deploy/current.json", encoded).await?;
+    }
     Ok(())
 }
 
@@ -1264,6 +1283,34 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
         "no wrangler.jsonc or wrangler.json in {}",
         directory.display()
     )
+}
+
+/// The Worker name a config declares, without bundling.
+///
+/// `celld dev` rejects duplicate names before `--clean` can discard state
+/// or the local store is opened. It reads the same `name` key `build`
+/// validates, with the same bound, so the early refusal agrees with the
+/// build without running esbuild twice.
+pub(crate) fn config_script_name(path: &Path) -> anyhow::Result<String> {
+    let source =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let config: Value = serde_json::from_str(&strip_jsonc(&source))
+        .with_context(|| format!("parse {}", path.display()))?;
+    let object = config
+        .as_object()
+        .ok_or_else(|| anyhow!("{} is not a JSON object", path.display()))?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("config has no `name`"))?
+        .to_string();
+    if !valid_script_name(&name) {
+        bail!(
+            "config `name` must contain 1 to {MAX_SCRIPT_NAME_BYTES} bytes of lowercase \
+             ASCII letters, digits, or internal hyphens: {name:?}"
+        );
+    }
+    Ok(name)
 }
 
 fn read_project(

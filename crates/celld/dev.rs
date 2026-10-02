@@ -13,7 +13,7 @@ use glob::{MatchOptions, Pattern};
 use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ pub fn open_local_bucket(database: &Path) -> anyhow::Result<Bucket> {
 #[derive(Debug)]
 struct Options {
     project: Option<PathBuf>,
+    configs: Vec<PathBuf>,
     clean: bool,
     stack: StackOptions,
 }
@@ -166,24 +167,26 @@ impl Console {
 }
 
 struct ProjectWatcher {
-    project: PathBuf,
+    projects: Vec<PathBuf>,
     ignored: Vec<Pattern>,
     _watcher: notify::RecommendedWatcher,
     changes: mpsc::UnboundedReceiver<notify::Result<notify::Event>>,
 }
 
 impl ProjectWatcher {
-    fn new(project: &Path, ignored: Vec<Pattern>) -> anyhow::Result<Self> {
+    fn new(projects: &[PathBuf], ignored: Vec<Pattern>) -> anyhow::Result<Self> {
         let (sender, changes) = mpsc::unbounded_channel();
         let mut watcher = notify::recommended_watcher(move |event| {
             let _ = sender.send(event);
         })
         .context("create the project watcher")?;
-        watcher
-            .watch(project, RecursiveMode::Recursive)
-            .with_context(|| format!("watch the project directory {}", project.display()))?;
+        for project in projects {
+            watcher
+                .watch(project, RecursiveMode::Recursive)
+                .with_context(|| format!("watch the project directory {}", project.display()))?;
+        }
         Ok(Self {
-            project: project.to_path_buf(),
+            projects: projects.to_vec(),
             ignored,
             _watcher: watcher,
             changes,
@@ -214,7 +217,7 @@ impl ProjectWatcher {
                 .await
                 .context("the project watcher stopped")?
             {
-                Ok(event) if relevant_project_event(&self.project, &event, &self.ignored) => {
+                Ok(event) if relevant_project_event(&self.projects, &event, &self.ignored) => {
                     return Ok(())
                 }
                 Ok(_) => {}
@@ -224,7 +227,11 @@ impl ProjectWatcher {
     }
 }
 
-fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Pattern]) -> bool {
+fn relevant_project_event(
+    projects: &[PathBuf],
+    event: &notify::Event,
+    ignored: &[Pattern],
+) -> bool {
     // A read is not a change. The inotify backend reports `Access(Open(Any))`
     // for every file that the bundler and the deploy step read, so a rebuild
     // produces the events that request the next rebuild and the supervisor
@@ -238,7 +245,27 @@ fn relevant_project_event(project: &Path, event: &notify::Event, ignored: &[Patt
     event
         .paths
         .iter()
-        .any(|path| !ignored_project_path(project, path, ignored))
+        .any(|path| !ignored_multi_project_path(projects, path, ignored))
+}
+
+/// The ignore decision for one event path across every watched root.
+///
+/// Nested roots resolve to the most-specific project containing the path, so
+/// a root-relative `--watch-ignore` glob means what the nearest config means
+/// by it. A path under no watched root is not ignored: there is no relative
+/// form to judge it by, and the relative `.celld` exclusion below must never
+/// ignore a whole project merely because an ancestor outside its root is
+/// named `.celld`.
+fn ignored_multi_project_path(projects: &[PathBuf], path: &Path, ignored: &[Pattern]) -> bool {
+    let Some(root) = projects
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|root| path.starts_with(root))
+        .max_by_key(|root| root.as_os_str().len())
+    else {
+        return false;
+    };
+    ignored_project_path(root, path, ignored)
 }
 
 fn ignored_project_path(project: &Path, path: &Path, ignored: &[Pattern]) -> bool {
@@ -333,21 +360,26 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n  celld dev -c CONFIG [-c CONFIG ...] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
-A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
-as for wrangler dev. Its entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+Repeat -c/--config to run several Workers in one session. The first config\n\
+owns the primary HTTP entry and the local .celld/dev state directory; the\n\
+remaining configs are dependencies reached through bindings. Pass either\n\
+PROJECT or repeated -c/--config, not both.\n\n\
+A .dev.vars file beside every config supplies Worker variables in dotenv form,\n\
+as for wrangler dev. Its entries override the vars of that config.\n\n\
+OPTIONS:\n  -c, --config PATH      Wrangler config or project directory; repeat for each Worker\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
 
 fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Options>> {
     let mut project = None;
+    let mut configs = Vec::new();
     let mut host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut port = DEFAULT_PORT;
     let mut clean = false;
@@ -385,6 +417,10 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                     bail!("--port must be between 1 and 65535");
                 }
             }
+            "-c" | "--config" => {
+                let value = arguments.next().context("-c/--config requires a value")?;
+                configs.push(PathBuf::from(value));
+            }
             other if other.starts_with('-') => bail!("unknown argument for `celld dev`: {other}"),
             value if project.is_none() => project = Some(PathBuf::from(value)),
             value => bail!("celld dev accepts one PROJECT, but also received {value:?}"),
@@ -393,8 +429,12 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     if !watch && !watch_ignores.is_empty() {
         bail!("--watch-ignore cannot be used with --no-watch");
     }
+    if !configs.is_empty() && project.is_some() {
+        bail!("celld dev accepts either PROJECT or repeated -c/--config, not both");
+    }
     Ok(Some(Options {
         project,
+        configs,
         clean,
         stack: StackOptions {
             listener: SocketAddr::new(host, port),
@@ -411,16 +451,54 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
         print_help()?;
         return Ok(());
     };
-    let config = deploy::resolve_config(options.project)?;
-    let config = std::fs::canonicalize(&config)
-        .with_context(|| format!("resolve Wrangler config {}", config.display()))?;
-    let project = config
+    let raw_configs: Vec<PathBuf> = if !options.configs.is_empty() {
+        // Each flag value names a directory or a config, exactly like PROJECT.
+        options
+            .configs
+            .into_iter()
+            .map(|given| deploy::resolve_config(Some(given)))
+            .collect::<anyhow::Result<Vec<_>>>()?
+    } else {
+        vec![deploy::resolve_config(options.project)?]
+    };
+    let mut configs = Vec::with_capacity(raw_configs.len());
+    for config in raw_configs {
+        configs.push(
+            std::fs::canonicalize(&config)
+                .with_context(|| format!("resolve Wrangler config {}", config.display()))?,
+        );
+    }
+    {
+        let mut seen = BTreeSet::new();
+        for config in &configs {
+            if !seen.insert(config.clone()) {
+                bail!("duplicate Wrangler config {}", config.display());
+            }
+        }
+    }
+    // Reject duplicate Worker names before `--clean` can discard state or
+    // the store is opened. The rebuild path rechecks the built names before
+    // any write, so a config edit that renames a Worker is still refused.
+    {
+        let mut seen = BTreeSet::new();
+        for config in &configs {
+            let name = deploy::config_script_name(config)?;
+            if !seen.insert(name.clone()) {
+                bail!("duplicate Worker name {:?}", name);
+            }
+        }
+    }
+    let primary_project = configs[0]
         .parent()
-        .context("the Wrangler config has no project directory")?;
-    let state = DevState::for_project(project);
+        .context("the Wrangler config has no project directory")?
+        .to_path_buf();
+    let state = DevState::for_project(&primary_project);
     let console = Console::new();
     console.header();
-    console.detail("Project", &config.display().to_string());
+    console.detail("Project", &configs[0].display().to_string());
+    for dependency in configs.iter().skip(1) {
+        console.detail("Config", &dependency.display().to_string());
+    }
     console.detail("State", &state.path().display().to_string());
     // The delete runs before the directory is recreated, and the console names
     // the outcome. A developer who reaches for this flag is already unsure
@@ -446,11 +524,11 @@ pub async fn run(arguments: Vec<String>) -> anyhow::Result<()> {
 
     let project_hash = format!(
         "{:x}",
-        Sha256::digest(project.as_os_str().as_encoded_bytes())
+        Sha256::digest(primary_project.as_os_str().as_encoded_bytes())
     );
     let store = open_store(state.path(), &console).await?;
     run_stack(
-        &config,
+        &configs,
         state.path(),
         options.stack,
         &project_hash,
@@ -511,27 +589,49 @@ fn read_dev_vars(config: &Path) -> anyhow::Result<BTreeMap<String, String>> {
         .collect())
 }
 
-async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Result<()> {
-    let bucket = open_local_bucket(&store.database)?;
-    let built = deploy::build(&deploy::Options {
-        config: Some(config.to_path_buf()),
-        bucket: None,
-        endpoint: None,
-        region: None,
-        dry_run: false,
-        json: false,
-        vars: read_dev_vars(config)?,
-        local_images: true,
-    })?;
-    if logs {
-        built.report();
+/// Build every config before writing any deployment, then write each
+/// dependency without moving the fleet pointer and publish the primary last.
+///
+/// The existing runtime generation traverses the service and Queue
+/// relationships from that fleet pointer, so no second runtime is built here.
+/// A failed build returns before any write, leaving the running app
+/// unchanged. The sequential writes make no atomicity promise.
+async fn deploy_session(configs: &[PathBuf], store: &Store, logs: bool) -> anyhow::Result<()> {
+    let mut built = Vec::with_capacity(configs.len());
+    for config in configs {
+        let one = deploy::build(&deploy::Options {
+            config: Some(config.clone()),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            dry_run: false,
+            json: false,
+            vars: read_dev_vars(config)?,
+            local_images: true,
+        })?;
+        if logs {
+            one.report();
+        }
+        built.push(one);
     }
+    {
+        let mut seen = BTreeSet::new();
+        for one in &built {
+            if !seen.insert(one.script_name.clone()) {
+                bail!("duplicate Worker name {:?}", one.script_name);
+            }
+        }
+    }
+    let bucket = open_local_bucket(&store.database)?;
     crate::wake_format::ensure_ready(&bucket).await?;
-    deploy::write(&bucket, &built).await
+    for dependency in built.iter().skip(1) {
+        deploy::write_without_current(&bucket, dependency).await?;
+    }
+    deploy::write(&bucket, &built[0]).await
 }
 
 async fn run_stack(
-    config: &Path,
+    configs: &[PathBuf],
     state: &Path,
     options: StackOptions,
     project_hash: &str,
@@ -543,16 +643,26 @@ async fn run_stack(
     // handler afterwards leaves the new node orphaned under the default Unix
     // signal action.
     let mut signals = ShutdownSignals::install()?;
-    let project = config
-        .parent()
-        .context("the Wrangler config has no project directory")?;
+    let mut roots: Vec<PathBuf> = configs
+        .iter()
+        .map(|config| {
+            config
+                .parent()
+                .context("the Wrangler config has no project directory")
+                .map(Path::to_path_buf)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    {
+        let mut seen = BTreeSet::new();
+        roots.retain(|root| seen.insert(root.clone()));
+    }
     let mut watcher = options
         .watch
-        .then(|| ProjectWatcher::new(project, options.watch_ignores))
+        .then(|| ProjectWatcher::new(&roots, options.watch_ignores))
         .transpose()?;
 
     console.progress("building the application");
-    deploy_project(config, store, options.logs).await?;
+    deploy_session(configs, store, options.logs).await?;
     let mut running = start_node(
         state,
         options.listener,
@@ -578,7 +688,7 @@ async fn run_stack(
             }
             NodeEvent::Reload => {
                 console.progress("change detected; rebuilding the application");
-                if let Err(error) = deploy_project(config, store, options.logs).await {
+                if let Err(error) = deploy_session(configs, store, options.logs).await {
                     console.failure(&format!("reload failed: {error:#}"));
                     continue;
                 }
