@@ -145,7 +145,10 @@ or set `FORCE_COLOR` to enable color when the output is not a terminal.
 
 The command watches the project and rebuilds the application after a
 source or configuration change. It keeps the current application running
-if a build fails, and a successful restart retains the durable state. See
+if a build fails, and a successful restart retains the durable state. Repeat
+`-c`/`--config` to run several Workers in one session; the first config owns
+the primary HTTP entry and `.celld/dev`, while the rest are dependencies reached
+through bindings. See
 the [documentation](docs/README.md#develop-an-application-locally) for
 the complete local-development contract.
 
